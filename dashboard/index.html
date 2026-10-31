@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CNL2 robot console</title>
+<style>
+  :root{--bg:#e6eaed;--sheet:#fafbfb;--ink:#17252e;--mute:#5d6f7a;--blue:#1d5fa6;--red:#c62f1d;--grid:#c5cfd6;--line:#d3dbe0}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 ui-sans-serif,"Segoe UI",system-ui,sans-serif;font-variant-numeric:tabular-nums}
+  header{display:flex;align-items:center;gap:12px;padding:12px 18px}
+  h1{font-size:18px;margin:0 auto 0 0;font-weight:650}
+  .pill{padding:3px 11px;border-radius:99px;background:var(--sheet);border:1px solid var(--line);font-size:13px}
+  .pill.ok{border-color:var(--blue);color:var(--blue)}
+  main{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:16px;padding:0 18px 18px}
+  .sheet{background:var(--sheet);border:1px solid var(--line);border-radius:6px}
+  .map{position:relative;min-height:420px;height:calc(100vh - 80px)}
+  canvas{width:100%;height:100%;display:block;border-radius:6px;cursor:crosshair}
+  .zoom{position:absolute;right:10px;top:10px;display:grid;gap:6px}
+  .zoom button{width:34px;height:34px;font-size:18px}
+  #hint{position:absolute;left:12px;bottom:10px;margin:0;color:var(--mute);font-size:13px}
+  aside{display:grid;gap:12px;align-content:start}
+  .card{padding:12px 14px}
+  .card h2{font-size:14px;margin:0 0 8px;font-weight:650}
+  button{font:inherit;border:1px solid var(--line);background:var(--sheet);color:var(--ink);border-radius:5px;cursor:pointer;padding:7px 10px}
+  button:hover{border-color:var(--blue)}
+  button:focus-visible,input:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+  .modes{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+  .modes button.on{background:var(--blue);border-color:var(--blue);color:#fff}
+  #estop{background:var(--red);border-color:var(--red);color:#fff;font-size:22px;font-weight:700;padding:16px;border-radius:6px}
+  #estop:hover{filter:brightness(1.08)}
+  .row{display:flex;justify-content:space-between;gap:8px}
+  .bar{height:8px;background:var(--line);border-radius:4px;margin:3px 0 8px;overflow:hidden}
+  .bar i{display:block;height:100%;background:var(--blue);width:0}
+  #vid{width:100%;border-radius:4px;display:none;background:#000}
+  #novid{margin:0;color:var(--mute);font-size:13px}
+  #pad{width:170px;height:170px;margin:auto;border-radius:50%;background:var(--bg);border:1px solid var(--line);position:relative;touch-action:none}
+  #knob{position:absolute;width:56px;height:56px;border-radius:50%;background:var(--blue);left:57px;top:57px}
+  label{display:block;font-size:13px;color:var(--mute)}
+  input[type=range]{width:100%}
+  #log{margin:0;padding:10px 12px;height:150px;overflow:auto;font:12px/1.4 ui-monospace,Consolas,monospace;white-space:pre-wrap}
+  .off{display:none}
+  @media (max-width:880px){main{grid-template-columns:1fr}.map{height:60vh}}
+  @media (prefers-reduced-motion:no-preference){.bar i{transition:width .1s}}
+</style>
+</head>
+<body>
+<header>
+  <h1>CNL2 robot console</h1>
+  <span id="mode" class="pill">Idle</span>
+  <span id="conn" class="pill">Connecting</span>
+</header>
+<main>
+  <section class="sheet map">
+    <canvas id="map"></canvas>
+    <div class="zoom"><button id="zi" aria-label="Zoom in">+</button><button id="zo" aria-label="Zoom out">&minus;</button></div>
+    <p id="hint"></p>
+  </section>
+  <aside>
+    <button id="estop">Stop robot</button>
+    <div class="sheet card">
+      <h2>Mode</h2>
+      <div class="modes" id="modes">
+        <button data-m="idle">Idle</button><button data-m="nav">Navigate</button><button data-m="manual">Manual</button>
+        <button data-m="follow1">Follow: turret</button><button data-m="follow2">Follow: distance</button><button data-m="follow3">Follow: avoid</button>
+      </div>
+    </div>
+    <div class="sheet card" id="tele">
+      <h2>Telemetry</h2>
+      <div class="row"><span>Position</span><span id="pose">-</span></div>
+      <div class="row"><span>Wheel speed</span><span id="rpm">-</span></div>
+      <div class="row"><span>Person</span><span id="tgt">-</span></div>
+      <div style="margin-top:8px">
+        <div class="row"><span>Left</span><span id="t0">-</span></div><div class="bar"><i id="b0"></i></div>
+        <div class="row"><span>Middle</span><span id="t1">-</span></div><div class="bar"><i id="b1"></i></div>
+        <div class="row"><span>Right</span><span id="t2">-</span></div><div class="bar"><i id="b2"></i></div>
+      </div>
+    </div>
+    <div class="sheet card">
+      <h2>Camera</h2>
+      <img id="vid" alt="Robot camera view">
+      <p id="novid">No video yet. Scripts send frames with send_frame().</p>
+    </div>
+    <div class="sheet card off" id="manual">
+      <h2>Drive</h2>
+      <div id="pad"><div id="knob"></div></div>
+      <p style="margin:8px 0 0;color:var(--mute);font-size:13px;text-align:center">Drag the pad, or use W A S D / arrow keys</p>
+    </div>
+    <div class="sheet card">
+      <h2>Follow settings</h2>
+      <label>Following distance: <b id="vd"></b> m<input id="sd" type="range" min="0.5" max="3" step="0.1"></label>
+      <label style="margin-top:8px">Top speed: <b id="vs"></b> m/s<input id="ss" type="range" min="0.1" max="0.6" step="0.05"></label>
+      <p style="margin:6px 0 0;color:var(--mute);font-size:13px">Applies the next time a follow mode starts.</p>
+    </div>
+    <div class="sheet"><pre id="log"></pre></div>
+  </aside>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const NAMES = {idle:"Idle", nav:"Navigate", manual:"Manual", follow1:"Follow: turret", follow2:"Follow: distance", follow3:"Follow: avoid"};
+let ws, mode = "idle", S = {}, scale = 60, drive = {l:0, r:0};
+
+function connect(){
+  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+  ws.onopen = () => { $("#conn").textContent = "Connected"; $("#conn").className = "pill ok"; };
+  ws.onclose = () => { $("#conn").textContent = "Reconnecting"; $("#conn").className = "pill"; setTimeout(connect, 1000); };
+  ws.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.t === "state"){ mode = m.mode; S = m.s; render(); }
+    else if (m.t === "log") log(m.line);
+    else if (m.t === "hello"){ m.log.forEach(log); setSliders(m.settings); }
+  };
+}
+const send = o => ws && ws.readyState === 1 && ws.send(JSON.stringify(o));
+setInterval(() => send({cmd:"hb"}), 500);
+
+function log(t){ const el = $("#log"); el.textContent += t + "\n"; el.textContent = el.textContent.split("\n").slice(-120).join("\n"); el.scrollTop = el.scrollHeight; }
+const f = (v, n = 2) => (v == null ? "-" : v.toFixed(n));
+
+function render(){
+  $("#mode").textContent = NAMES[mode];
+  document.querySelectorAll("#modes button").forEach(b => b.classList.toggle("on", b.dataset.m === mode));
+  $("#manual").classList.toggle("off", mode !== "manual");
+  $("#hint").textContent = mode === "nav" ? "Click the map to send the robot there." : "Switch to Navigate to set a goal on the map.";
+  const p = S.pose;
+  $("#pose").textContent = p ? `x ${f(p[0])}  y ${f(p[1])}  ${f(p[2] * 180 / Math.PI, 0)}\u00b0` : "-";
+  $("#rpm").textContent = S.rpm ? `${f(S.rpm[0], 0)} / ${f(S.rpm[1], 0)} rpm` : "-";
+  $("#tgt").textContent = S.target ? `${f(S.target.dist)} m at ${f(S.target.bearing, 0)}\u00b0` : "-";
+  [0, 1, 2].forEach(i => {
+    const v = S.tof && S.tof[i];
+    $("#t" + i).textContent = v == null ? "-" : f(v) + " m";
+    $("#b" + i).style.width = v == null ? "0" : Math.min(100, v / 2 * 100) + "%";
+  });
+  draw();
+}
+
+/* Map: centred on the robot, x right, y up, metres */
+const cv = $("#map"), cx = cv.getContext("2d");
+function view(){
+  const r = cv.getBoundingClientRect(), d = devicePixelRatio || 1;
+  if (cv.width !== Math.round(r.width * d)){ cv.width = r.width * d; cv.height = r.height * d; }
+  cx.setTransform(d, 0, 0, d, 0, 0);
+  const p = S.pose || [0, 0, 0];
+  return {W: r.width, H: r.height, ox: p[0], oy: p[1]};
+}
+function draw(){
+  const {W, H, ox, oy} = view();
+  const X = x => W / 2 + (x - ox) * scale, Y = y => H / 2 - (y - oy) * scale;
+  cx.clearRect(0, 0, W, H);
+  cx.lineWidth = 1; cx.strokeStyle = "#c5cfd6"; cx.fillStyle = "#5d6f7a"; cx.font = "11px system-ui";
+  const x0 = Math.floor(ox - W / 2 / scale), x1 = Math.ceil(ox + W / 2 / scale);
+  const y0 = Math.floor(oy - H / 2 / scale), y1 = Math.ceil(oy + H / 2 / scale);
+  for (let x = x0; x <= x1; x++){ cx.beginPath(); cx.moveTo(X(x), 0); cx.lineTo(X(x), H); cx.stroke(); if (x % 2 === 0) cx.fillText(x + " m", X(x) + 3, H - 4); }
+  for (let y = y0; y <= y1; y++){ cx.beginPath(); cx.moveTo(0, Y(y)); cx.lineTo(W, Y(y)); cx.stroke(); if (y % 2 === 0) cx.fillText(y + " m", 4, Y(y) - 3); }
+  const p = S.pose || [0, 0, 0], th = p[2];
+  (S.obstacles || []).forEach(o => { cx.fillStyle = "#17252e"; cx.fillRect(X(o[0]) - 3, Y(o[1]) - 3, 6, 6); });
+  if (S.path && S.path.length > 1){ cx.strokeStyle = "#1d5fa6"; cx.lineWidth = 2; cx.setLineDash([6, 4]); cx.beginPath(); S.path.forEach((q, i) => cx[i ? "lineTo" : "moveTo"](X(q[0]), Y(q[1]))); cx.stroke(); cx.setLineDash([]); }
+  if (S.goal){ const gx = X(S.goal[0]), gy = Y(S.goal[1]); cx.strokeStyle = "#c62f1d"; cx.lineWidth = 2; cx.beginPath(); cx.moveTo(gx - 8, gy - 8); cx.lineTo(gx + 8, gy + 8); cx.moveTo(gx + 8, gy - 8); cx.lineTo(gx - 8, gy + 8); cx.stroke(); }
+  if (S.tof) [Math.PI / 4, 0, -Math.PI / 4].forEach((a, i) => {   // left, middle, right
+    cx.strokeStyle = "rgba(29,95,166,.45)"; cx.lineWidth = 1.5; cx.beginPath(); cx.moveTo(X(p[0]), Y(p[1]));
+    cx.lineTo(X(p[0] + S.tof[i] * Math.cos(th + a)), Y(p[1] + S.tof[i] * Math.sin(th + a))); cx.stroke();
+  });
+  if (S.target){ const a = th + S.target.bearing * Math.PI / 180;
+    cx.strokeStyle = "#c62f1d"; cx.lineWidth = 2; cx.beginPath(); cx.arc(X(p[0] + S.target.dist * Math.cos(a)), Y(p[1] + S.target.dist * Math.sin(a)), 9, 0, 7); cx.stroke(); }
+  cx.save(); cx.translate(X(p[0]), Y(p[1])); cx.rotate(-th); cx.fillStyle = "#1d5fa6";
+  cx.beginPath(); cx.moveTo(14, 0); cx.lineTo(-9, 9); cx.lineTo(-5, 0); cx.lineTo(-9, -9); cx.fill(); cx.restore();
+}
+cv.addEventListener("click", e => {
+  if (mode !== "nav") return;
+  const {W, H, ox, oy} = view(), r = cv.getBoundingClientRect();
+  send({cmd:"goto", x: ox + (e.clientX - r.left - W / 2) / scale, y: oy - (e.clientY - r.top - H / 2) / scale});
+});
+$("#zi").onclick = () => { scale = Math.min(200, scale * 1.4); draw(); };
+$("#zo").onclick = () => { scale = Math.max(12, scale / 1.4); draw(); };
+addEventListener("resize", draw);
+
+/* Controls */
+document.querySelectorAll("#modes button").forEach(b => b.onclick = () => send({cmd:"mode", mode: b.dataset.m}));
+$("#estop").onclick = () => send({cmd:"estop"});
+const keys = new Set();
+addEventListener("keydown", e => {
+  if (e.code === "Space"){ e.preventDefault(); send({cmd:"estop"}); return; }
+  keys.add(e.key.toLowerCase());
+});
+addEventListener("keyup", e => keys.delete(e.key.toLowerCase()));
+
+const pad = $("#pad"), knob = $("#knob"); let padVec = null;
+function padMove(e){
+  const r = pad.getBoundingClientRect();
+  let x = (e.clientX - r.left - r.width / 2) / (r.width / 2), y = (e.clientY - r.top - r.height / 2) / (r.height / 2);
+  const m = Math.hypot(x, y); if (m > 1){ x /= m; y /= m; }
+  padVec = {x, y}; knob.style.left = 57 + x * 57 + "px"; knob.style.top = 57 + y * 57 + "px";
+}
+pad.onpointerdown = e => { pad.setPointerCapture(e.pointerId); padMove(e); };
+pad.onpointermove = e => { if (padVec) padMove(e); };
+pad.onpointerup = pad.onpointercancel = () => { padVec = null; knob.style.left = knob.style.top = "57px"; };
+
+setInterval(() => {
+  if (mode !== "manual") return;
+  let v = 0, w = 0;
+  if (padVec){ v = -padVec.y * 0.4; w = padVec.x * 0.25; }
+  else {
+    if (keys.has("w") || keys.has("arrowup")) v += 0.35;
+    if (keys.has("s") || keys.has("arrowdown")) v -= 0.35;
+    if (keys.has("d") || keys.has("arrowright")) w += 0.25;
+    if (keys.has("a") || keys.has("arrowleft")) w -= 0.25;
+  }
+  send({cmd:"drive", l: v + w, r: v - w});   // turning right: left wheel faster
+}, 50);
+
+function setSliders(s){ $("#sd").value = s.target_dist; $("#ss").value = s.max_speed; showS(); }
+function showS(){ $("#vd").textContent = (+$("#sd").value).toFixed(1); $("#vs").textContent = (+$("#ss").value).toFixed(2); }
+[$("#sd"), $("#ss")].forEach(el => el.oninput = () => { showS(); send({cmd:"settings", target_dist: +$("#sd").value, max_speed: +$("#ss").value}); });
+
+/* Video appears once frames arrive */
+const vid = $("#vid");
+vid.onload = () => { vid.style.display = "block"; $("#novid").style.display = "none"; };
+vid.onerror = () => { vid.style.display = "none"; $("#novid").style.display = "block"; setTimeout(() => vid.src = "/video?" + Date.now(), 3000); };
+vid.src = "/video";
+
+connect(); draw();
+</script>
+</body>
+</html>
