@@ -19,8 +19,9 @@
   .left{display:flex;flex-direction:column;align-items:center}
   .mapbox{position:relative;width:min(100%,max(320px,calc(100vh - 150px)));aspect-ratio:1/1;background:var(--sheet);border:1px solid var(--line);border-radius:8px;overflow:hidden}
   canvas{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair}
-  .zoom{position:absolute;right:10px;top:10px;display:grid;gap:6px}
-  .zoom button{width:34px;height:34px;font-size:18px;padding:0}
+  .dims{display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:8px 14px;margin-top:10px;font-size:14px}
+  .dims label{display:inline-flex;align-items:center;gap:6px;margin:0;color:var(--ink)}
+  .dims input{width:84px;font:inherit;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--sheet);color:var(--ink)}
   #hint{margin:10px 0 0;color:var(--mute);font-size:13px;text-align:center}
   aside{display:grid;gap:12px}
   .sheet{background:var(--sheet);border:1px solid var(--line);border-radius:8px}
@@ -75,9 +76,12 @@
   <section class="left">
     <div class="mapbox">
       <canvas id="map"></canvas>
-      <div class="zoom"><button id="zi" aria-label="Zoom in">+</button><button id="zo" aria-label="Zoom out">&minus;</button></div>
     </div>
     <p id="hint"></p>
+    <div class="dims"><b>Warehouse</b>
+      <label>Length <input id="dl" type="number" min="2" max="200" step="0.5"> m</label>
+      <label>Width <input id="dw" type="number" min="2" max="200" step="0.5"> m</label>
+    </div>
   </section>
   <aside>
     <div class="stopbar"><button id="estop">Stop robot</button></div>
@@ -89,13 +93,12 @@
       </div>
       <div id="p-follow">
         <div class="stages">
-          <button class="stage" data-s="follow1">Stage 1 <small>Turn to face the person</small></button>
-          <button class="stage" data-s="follow2">Stage 2 <small>Also keep a set distance</small></button>
-          <button class="stage" data-s="follow3">Stage 3 <small>Also avoid obstacles</small></button>
+          <button class="stage" data-s="follow1">Turn only <small>Stays put, faces the person</small></button>
+          <button class="stage" data-s="follow3">Full follow <small>Keeps distance, avoids obstacles</small></button>
         </div>
         <label>Following distance: <b id="vd"></b> m<input id="sd" type="range" min="0.5" max="3" step="0.1"></label>
         <label>Top speed: <b id="vs"></b> m/s<input id="ss" type="range" min="0.1" max="0.6" step="0.05"></label>
-        <p class="note">Settings apply the next time following starts.</p>
+        <p class="note">Settings apply the next time following starts. Distance only affects full follow.</p>
         <button class="go" id="go-follow"></button>
       </div>
       <div id="p-nav">
@@ -137,13 +140,13 @@
 </main>
 <script>
 const $ = s => document.querySelector(s), $$ = s => document.querySelectorAll(s);
-const FOLLOW = ["follow1", "follow2", "follow3"], SPANS = [4, 6, 10, 16, 30];
-const NAMES = {idle:"Idle", nav:"Navigating", manual:"Manual drive", follow1:"Following: turn only", follow2:"Following: keep distance", follow3:"Following: avoid obstacles"};
-let ws, mode = "idle", lastMode = null, S = {}, tab = "follow", stage = "follow3", si = 2;
+const FOLLOW = ["follow1", "follow3"];
+const NAMES = {idle:"Idle", nav:"Navigating", manual:"Manual drive", follow1:"Following: turn only", follow3:"Following: full"};
+let ws, mode = "idle", lastMode = null, S = {}, tab = "follow", stage = "follow3";
 
 function connect(){
   ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
-  ws.onopen = () => { $("#conn").className = "pill ok"; $("#conn span").textContent = "Connected"; };
+  ws.onopen = () => { $("#conn").className = "pill ok"; $("#conn span").textContent = "Connected"; sendMap(); };
   ws.onclose = () => { $("#conn").className = "pill"; $("#conn span").textContent = "Reconnecting"; setTimeout(connect, 1000); };
   ws.onmessage = e => {
     const m = JSON.parse(e.data);
@@ -178,7 +181,7 @@ function render(){
   setGo("#go-nav", mode === "nav", "Start navigation", "Stop navigation");
   setGo("#go-manual", mode === "manual", "Turn on manual drive", "Turn off manual drive");
   $("#padwrap").hidden = mode !== "manual";
-  $("#hint").textContent = (mode === "nav" ? "Click the map to send the robot there. " : "Start navigation to set goals on the map. ") + `Map is ${SPANS[si]} m wide, centred on the start point.`;
+  $("#hint").textContent = (mode === "nav" ? "Click the map to send the robot there. " : "Start navigation to set goals on the map. ") + `Warehouse ${dims.len} \u00d7 ${dims.wid} m. Origin (0, 0) is the robot's start point, at the centre.`;
   const p = S.pose;
   $("#pose").textContent = p ? `${f(p[0])}, ${f(p[1])} m` : "-";
   $("#head").textContent = p ? f(p[2] * 180 / Math.PI, 0) + "\u00b0" : "-";
@@ -193,26 +196,46 @@ function render(){
   draw();
 }
 
-/* Map: fixed square, origin at the centre, x right, y up, metres */
+/* Map: a fixed square box showing the warehouse rectangle to scale.
+   Origin (0, 0) is the robot's start point, drawn at the centre; length runs along x, width along y. */
 const cv = $("#map"), cx = cv.getContext("2d");
+function loadDims(){
+  try { const d = JSON.parse(localStorage.getItem("cnl2dims")); if (d && d.len >= 2 && d.wid >= 2) return d; } catch (e) {}
+  return {len: 12, wid: 8};
+}
+let dims = loadDims();
+const sendMap = () => send({cmd:"map", length: dims.len, width: dims.wid});
 function view(){
   const r = cv.getBoundingClientRect(), d = devicePixelRatio || 1;
   if (cv.width !== Math.round(r.width * d)){ cv.width = r.width * d; cv.height = r.height * d; }
   cx.setTransform(d, 0, 0, d, 0, 0);
-  return {W: r.width, H: r.height, k: r.width / SPANS[si]};
+  return {W: r.width, H: r.height, k: 0.94 * Math.min(r.width / dims.len, r.height / dims.wid)};
 }
 function draw(){
-  const {W, H, k} = view(), span = SPANS[si];
+  const {W, H, k} = view(), hl = dims.len / 2, hw = dims.wid / 2;
   const X = x => W / 2 + x * k, Y = y => H / 2 - y * k;
   cx.clearRect(0, 0, W, H);
-  const step = span <= 6 ? 0.5 : span <= 12 ? 1 : span <= 20 ? 2 : 5, half = span / 2;
+  cx.fillStyle = "#eef2f4"; cx.fillRect(0, 0, W, H);                                   // outside the warehouse
+  cx.fillStyle = "#fbfcfc"; cx.fillRect(X(-hl), Y(hw), dims.len * k, dims.wid * k);    // floor
+  const step = [0.5, 1, 2, 5, 10, 20].find(s => Math.max(dims.len, dims.wid) / s <= 14) || 50;
   cx.font = "11px system-ui"; cx.lineWidth = 1;
-  for (let i = -Math.floor(half / step); i <= Math.floor(half / step); i++){
-    const v = i * step, major = i % 2 === 0;
-    cx.strokeStyle = v === 0 ? "#8fa0ab" : major ? "#c5cfd6" : "#e1e7eb";
-    cx.beginPath(); cx.moveTo(X(v), 0); cx.lineTo(X(v), H); cx.moveTo(0, Y(v)); cx.lineTo(W, Y(v)); cx.stroke();
-    if (major && v !== 0){ cx.fillStyle = "#5d6f7a"; cx.fillText(v + " m", X(v) + 3, H - 5); cx.fillText(v + " m", 5, Y(v) - 3); }
+  for (let i = Math.ceil(-hl / step); i <= Math.floor(hl / step); i++){
+    const v = i * step;
+    cx.strokeStyle = v === 0 ? "#8fa0ab" : i % 2 === 0 ? "#c5cfd6" : "#e1e7eb";
+    cx.beginPath(); cx.moveTo(X(v), Y(hw)); cx.lineTo(X(v), Y(-hw)); cx.stroke();
+    if (i % 2 === 0 && v !== 0){ cx.fillStyle = "#5d6f7a"; cx.fillText(v + " m", X(v) + 3, Y(-hw) - 5); }
   }
+  for (let i = Math.ceil(-hw / step); i <= Math.floor(hw / step); i++){
+    const v = i * step;
+    cx.strokeStyle = v === 0 ? "#8fa0ab" : i % 2 === 0 ? "#c5cfd6" : "#e1e7eb";
+    cx.beginPath(); cx.moveTo(X(-hl), Y(v)); cx.lineTo(X(hl), Y(v)); cx.stroke();
+    if (i % 2 === 0 && v !== 0){ cx.fillStyle = "#5d6f7a"; cx.fillText(v + " m", X(-hl) + 5, Y(v) - 3); }
+  }
+  cx.strokeStyle = "#17252e"; cx.lineWidth = 2; cx.strokeRect(X(-hl), Y(hw), dims.len * k, dims.wid * k);   // walls
+  cx.fillStyle = "#17252e"; cx.font = "600 12px system-ui"; cx.textAlign = "center";
+  cx.fillText(dims.len + " m", W / 2, Y(hw) - 7);
+  cx.save(); cx.translate(X(-hl) - 7, H / 2); cx.rotate(-Math.PI / 2); cx.fillText(dims.wid + " m", 0, 0); cx.restore();
+  cx.textAlign = "left"; cx.font = "11px system-ui";
   const p = S.pose || [0, 0, 0], th = p[2];
   (S.obstacles || []).forEach(o => { cx.fillStyle = "#17252e"; cx.fillRect(X(o[0]) - 3, Y(o[1]) - 3, 6, 6); });
   if (S.path && S.path.length > 1){ cx.strokeStyle = "#1d5fa6"; cx.lineWidth = 2; cx.setLineDash([6, 4]); cx.beginPath(); S.path.forEach((q, i) => cx[i ? "lineTo" : "moveTo"](X(q[0]), Y(q[1]))); cx.stroke(); cx.setLineDash([]); }
@@ -229,10 +252,22 @@ function draw(){
 cv.addEventListener("click", e => {
   if (mode !== "nav") return;
   const {W, H, k} = view(), r = cv.getBoundingClientRect();
-  send({cmd:"goto", x: (e.clientX - r.left - W / 2) / k, y: -(e.clientY - r.top - H / 2) / k});
+  const x = (e.clientX - r.left - W / 2) / k, y = -(e.clientY - r.top - H / 2) / k;
+  if (Math.abs(x) > dims.len / 2 || Math.abs(y) > dims.wid / 2) return;   // outside the warehouse
+  send({cmd:"goto", x, y});
 });
-$("#zi").onclick = () => { si = Math.max(0, si - 1); render(); };
-$("#zo").onclick = () => { si = Math.min(SPANS.length - 1, si + 1); render(); };
+function showDims(){ $("#dl").value = dims.len; $("#dw").value = dims.wid; }
+function setDims(){
+  const len = +$("#dl").value, wid = +$("#dw").value;
+  if (len >= 2 && len <= 200 && wid >= 2 && wid <= 200){
+    dims = {len, wid};
+    try { localStorage.setItem("cnl2dims", JSON.stringify(dims)); } catch (e) {}
+    sendMap();
+  }
+  showDims(); render();
+}
+$("#dl").onchange = $("#dw").onchange = setDims;
+showDims();
 addEventListener("resize", draw);
 
 /* Mode controls */

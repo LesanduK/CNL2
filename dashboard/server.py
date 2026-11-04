@@ -39,6 +39,7 @@ class Hub:
         self.mode, self.proc, self.manual, self.frame = "idle", None, None, None
         self.hb, self.drive = time.time(), (0.0, 0.0, 0.0)
         self.settings = {"target_dist": 1.2, "max_speed": 0.35}
+        self.map = (12.0, 8.0)  # warehouse length, width in metres (used by --sim)
 
 
 hub = Hub()
@@ -202,7 +203,8 @@ async def simulate():
     Follow modes chase a fake person who walks a slow loop: stage 1 only turns, stage 2 also keeps
     its distance, stage 3 also steers around the obstacles."""
     x = y = th = 0.0
-    obstacles = [[1.5, 0.5], [1.6, 0.6], [2.5, -0.8], [-1.2, 1.4]]
+    base = [[1.5, 0.5], [1.6, 0.6], [2.5, -0.8], [-1.2, 1.4]]  # laid out for a 12 x 8 m floor, scaled to fit
+    obstacles = base
 
     def wrap(a):
         return (a + math.pi) % (2 * math.pi) - math.pi
@@ -217,6 +219,8 @@ async def simulate():
     while True:
         await asyncio.sleep(0.05)
         t, m, v, w = time.time(), hub.mode, 0.0, 0.0
+        L, Wd = hub.map
+        obstacles = [[ox * L / 12, oy * Wd / 8] for ox, oy in base]
         if m == "manual" and t - hub.drive[2] < 0.4:
             l, r = hub.drive[:2]
             v, w = (l + r) / 2, (r - l) / BASE
@@ -229,7 +233,7 @@ async def simulate():
                 w, v = 2 * err, 0.3 * max(0.0, math.cos(err))
                 hub.state["path"] = [[x, y], [gx, gy]]
         elif m.startswith("follow"):
-            px, py = 2.5 * math.cos(t * 0.12), 1.8 * math.sin(t * 0.18)  # the fake person
+            px, py = 0.32 * L * math.cos(t * 0.12), 0.32 * Wd * math.sin(t * 0.18)  # the fake person
             dist = math.hypot(px - x, py - y)
             err = wrap(math.atan2(py - y, px - x) - th)  # positive = person is to the left
             hub.state["target"] = {"bearing": math.degrees(err), "dist": None if m == "follow1" else dist}
@@ -244,6 +248,7 @@ async def simulate():
                         w -= (1.0 if eb >= 0 else -1.0) * 1.5 * (0.8 - d) / 0.8  # steer away
                         v = 0.0 if d < 0.3 else min(v, 0.15)
         x, y, th = x + v * math.cos(th) * 0.05, y + v * math.sin(th) * 0.05, th + w * 0.05
+        x, y = max(-L / 2 + 0.2, min(L / 2 - 0.2, x)), max(-Wd / 2 + 0.2, min(Wd / 2 - 0.2, y))  # stay inside the walls
         if m != "idle":
             hub.state.update(pose=[x, y, th], rpm=[(v - w * BASE / 2) * 60 / (2 * math.pi * WHEEL_R),
                                                    (v + w * BASE / 2) * 60 / (2 * math.pi * WHEEL_R)],
@@ -326,6 +331,8 @@ async def ws(w: WebSocket):
                 if hub.manual:
                     hub.manual.drive(l, r)
                 hub.drive = (l, r, time.time())
+            elif c == "map":
+                hub.map = tuple(max(2.0, min(200.0, float(m[k]))) for k in ("length", "width"))
             elif c == "settings":
                 for k in hub.settings:
                     if k in m:
