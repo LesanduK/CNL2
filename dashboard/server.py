@@ -9,7 +9,7 @@ One mode runs at a time (it owns the serial port, camera and ToF sensors):
   manual drives the ESP32 directly over serial using the documented protocol.
 Mode scripts can push live data with dashboard/telemetry_client.py (optional).
 """
-import argparse, asyncio, contextlib, json, math, signal, sys, threading, time
+import argparse, asyncio, contextlib, json, math, os, signal, subprocess, sys, threading, time
 from collections import deque
 from pathlib import Path
 
@@ -119,7 +119,10 @@ class Manual:
 async def stop_all():
     p, hub.proc = hub.proc, None
     if p and p.returncode is None:
-        p.send_signal(signal.SIGINT)  # lets the script send its own stop
+        try:
+            p.send_signal(signal.SIGINT)  # lets the script send its own stop
+        except (ValueError, OSError):  # Windows cannot send SIGINT to a subprocess
+            p.terminate()
         try:
             await asyncio.wait_for(p.wait(), 2)
         except asyncio.TimeoutError:
@@ -139,6 +142,21 @@ async def pump(p):
         hub.proc, hub.mode, hub.state = None, "idle", {}
 
 
+_help = {}
+
+
+def supports(base, flag):
+    """True if the script lists the flag in its --help (stage 1 has no --target-dist)."""
+    key = tuple(base)
+    if key not in _help:
+        try:
+            r = subprocess.run(base + ["--help"], cwd=ROOT, capture_output=True, text=True, errors="replace", timeout=30)
+            _help[key] = r.stdout + r.stderr
+        except Exception:
+            _help[key] = ""
+    return flag in _help[key]
+
+
 async def set_mode(m):
     await stop_all()
     if m == "idle":
@@ -156,12 +174,15 @@ async def set_mode(m):
     else:
         cmd = list(MODES[m])
         if m.startswith("follow"):
-            cmd += ["--target-dist", str(hub.settings["target_dist"]), "--max-speed", str(hub.settings["max_speed"])]
+            for flag, key in (("--target-dist", "target_dist"), ("--max-speed", "max_speed")):
+                if await asyncio.to_thread(supports, MODES[m], flag):
+                    cmd += [flag, str(hub.settings[key])]
         if args.mock:
             cmd.append("--mock")
         hub.proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=ROOT, stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"})  # unbuffered so the log fills live
         asyncio.create_task(pump(hub.proc))
         await logline("Started: " + " ".join(cmd[1:]))
 
@@ -177,8 +198,22 @@ async def goto(x, y):
 
 
 async def simulate():
-    """Fake robot so the UI can be tried without hardware (--sim)."""
+    """Fake robot so the UI can be tried without hardware (--sim).
+    Follow modes chase a fake person who walks a slow loop: stage 1 only turns, stage 2 also keeps
+    its distance, stage 3 also steers around the obstacles."""
     x = y = th = 0.0
+    obstacles = [[1.5, 0.5], [1.6, 0.6], [2.5, -0.8], [-1.2, 1.4]]
+
+    def wrap(a):
+        return (a + math.pi) % (2 * math.pi) - math.pi
+
+    def ray(a):  # distance to the nearest obstacle inside a 20 degree cone, 2 m if clear
+        best = 2.0
+        for ox, oy in obstacles:
+            if abs(wrap(math.atan2(oy - y, ox - x) - th - a)) < 0.35:
+                best = min(best, math.hypot(ox - x, oy - y))
+        return best
+
     while True:
         await asyncio.sleep(0.05)
         t, m, v, w = time.time(), hub.mode, 0.0, 0.0
@@ -187,19 +222,32 @@ async def simulate():
             v, w = (l + r) / 2, (r - l) / BASE
         elif m == "nav" and "goal" in hub.state:
             gx, gy = hub.state["goal"]
-            err = (math.atan2(gy - y, gx - x) - th + math.pi) % (2 * math.pi) - math.pi
+            err = wrap(math.atan2(gy - y, gx - x) - th)
             if math.hypot(gx - x, gy - y) < 0.08:
                 hub.state.pop("goal")
             else:
                 w, v = 2 * err, 0.3 * max(0.0, math.cos(err))
                 hub.state["path"] = [[x, y], [gx, gy]]
         elif m.startswith("follow"):
-            hub.state["target"] = {"bearing": 20 * math.sin(t / 2), "dist": 1.2 + 0.3 * math.sin(t / 3)}
+            px, py = 2.5 * math.cos(t * 0.12), 1.8 * math.sin(t * 0.18)  # the fake person
+            dist = math.hypot(px - x, py - y)
+            err = wrap(math.atan2(py - y, px - x) - th)  # positive = person is to the left
+            hub.state["target"] = {"bearing": math.degrees(err), "dist": None if m == "follow1" else dist}
+            w = max(-1.5, min(1.5, 2.0 * err)) if abs(err) > 0.05 else 0.0
+            td = hub.settings["target_dist"]
+            if m != "follow1" and abs(err) < 0.7 and dist > td + 0.1:
+                v = min(hub.settings["max_speed"], 0.8 * (dist - td))
+            if m == "follow3":
+                for ox, oy in obstacles:
+                    d, eb = math.hypot(ox - x, oy - y), wrap(math.atan2(oy - y, ox - x) - th)
+                    if d < 0.8 and abs(eb) < 1.2:
+                        w -= (1.0 if eb >= 0 else -1.0) * 1.5 * (0.8 - d) / 0.8  # steer away
+                        v = 0.0 if d < 0.3 else min(v, 0.15)
         x, y, th = x + v * math.cos(th) * 0.05, y + v * math.sin(th) * 0.05, th + w * 0.05
         if m != "idle":
-            hub.state.update(pose=[x, y, th], rpm=[v * 60, v * 60],
-                             tof=[1.5 + 0.2 * math.sin(t), 1.2 + 0.3 * math.sin(t / 2), 1.8],
-                             obstacles=[[1.5, 0.5], [1.6, 0.6], [2.5, -0.8]])
+            hub.state.update(pose=[x, y, th], rpm=[(v - w * BASE / 2) * 60 / (2 * math.pi * WHEEL_R),
+                                                   (v + w * BASE / 2) * 60 / (2 * math.pi * WHEEL_R)],
+                             tof=[ray(math.pi / 4), ray(0.0), ray(-math.pi / 4)], obstacles=obstacles)
 
 
 class UDP(asyncio.DatagramProtocol):
