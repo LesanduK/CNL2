@@ -9,7 +9,7 @@ One mode runs at a time (it owns the serial port, camera and ToF sensors):
   manual drives the ESP32 directly over serial using the documented protocol.
 Mode scripts can push live data with dashboard/telemetry_client.py (optional).
 """
-import argparse, asyncio, contextlib, json, math, os, signal, subprocess, sys, threading, time
+import argparse, asyncio, contextlib, json, math, os, re, signal, subprocess, sys, threading, time
 from collections import deque
 from pathlib import Path
 
@@ -40,6 +40,10 @@ class Hub:
         self.hb, self.drive = time.time(), (0.0, 0.0, 0.0)
         self.settings = {"target_dist": 1.2, "max_speed": 0.35}
         self.map = (12.0, 8.0)  # warehouse length, width in metres (used by --sim)
+        self.route = {"a": None, "b": None}  # back-and-forth points chosen on the map
+        self.shuttle = {"on": False}
+        self.arrived = self.pose_seen = self.pose_warned = False
+        self.pose_polls, self.last_poll = 0, 0.0
 
 
 hub = Hub()
@@ -132,11 +136,34 @@ async def stop_all():
         await asyncio.to_thread(hub.manual.close)
         hub.manual = None
     hub.mode, hub.state, hub.frame = "idle", {}, None
+    hub.shuttle, hub.arrived, hub.pose_seen, hub.pose_polls, hub.pose_warned = {"on": False}, False, False, 0, False
+
+
+# The navigation shell is read for two things while a back-and-forth run is active: a reply to
+# "pose" (X=.. Y=..) and an arrival message. Either one tells the server the robot got there.
+ARRIVED = re.compile(r"(goal|destination|target|waypoint)\s+(has\s+been\s+)?reached|reached\s+(the\s+)?(goal|destination|target)|\barrived\b|navigation\s+complete", re.I)
+
+
+def read_pose(line):
+    mx = re.search(r"\bx\s*[=:]\s*(-?\d+(?:\.\d+)?)", line, re.I)
+    my = re.search(r"\by\s*[=:]\s*(-?\d+(?:\.\d+)?)", line, re.I)
+    if not (mx and my):
+        return False
+    pose = hub.state.get("pose") or [0.0, 0.0, 0.0]
+    hub.state["pose"] = [float(mx.group(1)), float(my.group(1)), pose[2]]
+    hub.pose_seen = True
+    return True
 
 
 async def pump(p):
     async for raw in p.stdout:
-        await logline(raw.decode(errors="replace").rstrip())
+        line = raw.decode(errors="replace").rstrip()
+        if hub.shuttle.get("on"):
+            arrived = bool(ARRIVED.search(line))
+            hub.arrived = hub.arrived or arrived
+            if read_pose(line) and not arrived:
+                continue  # position replies are consumed instead of filling the log
+        await logline(line)
     await p.wait()
     await logline(f"Process exited with code {p.returncode}")
     if hub.proc is p:
@@ -196,6 +223,69 @@ async def goto(x, y):
         hub.proc.stdin.write(f"goto {x:.2f} {y:.2f}\n".encode())
         await hub.proc.stdin.drain()
     await logline(f"Goal set to ({x:.2f}, {y:.2f}) m")
+
+
+async def start_shuttle(pause):
+    a, b = hub.route["a"], hub.route["b"]
+    if hub.mode != "nav":
+        return await logline("Start navigation first, then the back-and-forth run")
+    if not (a and b):
+        return await logline("Set both the start point and the end point first")
+    pose = hub.state.get("pose") or a
+    first = math.hypot(pose[0] - a[0], pose[1] - a[1])
+    hub.shuttle = {"on": True, "target": "A", "phase": "drive", "trips": 0, "count": False,
+                   "pause": max(0.0, min(60.0, pause)), "t0": time.time(), "until": 0.0,
+                   "limit": 30 + max(first, math.hypot(b[0] - a[0], b[1] - a[1])) / 0.08}
+    hub.arrived = False
+    await goto(*a)
+    await logline(f"Back-and-forth run started between A ({a[0]:.2f}, {a[1]:.2f}) and B ({b[0]:.2f}, {b[1]:.2f})")
+
+
+async def stop_shuttle(reason="Back-and-forth run stopped"):
+    if not hub.shuttle.get("on"):
+        return
+    hub.shuttle = {"on": False}
+    hub.state.pop("goal", None)
+    if hub.proc and hub.proc.stdin:
+        hub.proc.stdin.write(b"stop\n")
+        await hub.proc.stdin.drain()
+    await logline(reason)
+
+
+async def shuttle_loop():
+    """Drives to A, then B, then A... Arrival = pose within 15 cm of the point, or the script saying so."""
+    while True:
+        await asyncio.sleep(0.2)
+        sh, now = hub.shuttle, time.time()
+        if not sh.get("on"):
+            continue
+        if hub.mode != "nav":
+            hub.shuttle = {"on": False}
+            continue
+        if sh["phase"] == "pause":
+            if now >= sh["until"]:
+                sh["target"] = "B" if sh["target"] == "A" else "A"
+                sh["phase"], sh["t0"], hub.arrived = "drive", now, False
+                await goto(*hub.route[sh["target"].lower()])
+            continue
+        gx, gy = hub.route[sh["target"].lower()]
+        pose = hub.state.get("pose")
+        if not args.sim and hub.pose_polls >= 4 and not hub.pose_seen and not hub.pose_warned:
+            hub.pose_warned = True
+            await logline("Could not read the robot position from the navigation script; relying on its arrival message")
+        if hub.arrived or (pose and math.hypot(pose[0] - gx, pose[1] - gy) <= 0.15):
+            hub.arrived = False
+            if sh["count"]:
+                sh["trips"] += 1
+            sh["count"], sh["phase"], sh["until"] = True, "pause", now + sh["pause"]
+            await logline(f"Reached point {sh['target']}")
+        elif now - sh["t0"] > sh["limit"]:
+            await stop_shuttle(f"Stopped: the robot did not reach point {sh['target']} in time")
+        elif not args.sim and hub.proc and hub.proc.stdin and now - hub.last_poll >= 1.0 and (hub.pose_seen or hub.pose_polls < 4):
+            hub.last_poll = now
+            hub.pose_polls += 0 if hub.pose_seen else 1
+            hub.proc.stdin.write(b"pose\n")
+            await hub.proc.stdin.drain()
 
 
 async def simulate():
@@ -270,7 +360,8 @@ async def ticker():
     while True:
         await asyncio.sleep(0.1)
         if hub.clients:
-            await bcast({"t": "state", "mode": hub.mode, "s": hub.state})
+            await bcast({"t": "state", "mode": hub.mode, "s": hub.state, "route": hub.route,
+                         "shuttle": {k: hub.shuttle.get(k) for k in ("on", "target", "phase", "trips")}})
         if hub.mode != "idle" and args.stop_on_disconnect and time.time() - hub.hb > 2:
             await logline("Browser connection lost, stopping the robot")
             await stop_all()
@@ -279,7 +370,7 @@ async def ticker():
 @contextlib.asynccontextmanager
 async def life(app):
     await asyncio.get_running_loop().create_datagram_endpoint(UDP, local_addr=("127.0.0.1", UDP_PORT))
-    tasks = [asyncio.create_task(ticker())]
+    tasks = [asyncio.create_task(ticker()), asyncio.create_task(shuttle_loop())]
     if args.sim:
         tasks.append(asyncio.create_task(simulate()))
     yield
@@ -314,7 +405,7 @@ async def ws(w: WebSocket):
     await w.accept()
     hub.clients.add(w)
     hub.hb = time.time()
-    await w.send_text(json.dumps({"t": "hello", "log": list(hub.log), "settings": hub.settings}))
+    await w.send_text(json.dumps({"t": "hello", "log": list(hub.log), "settings": hub.settings, "route": hub.route}))
     try:
         while True:
             m = json.loads(await w.receive_text())
@@ -325,7 +416,17 @@ async def ws(w: WebSocket):
                 await stop_all()
                 await logline("Emergency stop pressed")
             elif c == "goto":
-                await goto(float(m["x"]), float(m["y"]))
+                if not hub.shuttle.get("on"):
+                    await goto(float(m["x"]), float(m["y"]))
+            elif c == "route":
+                for k in ("a", "b"):
+                    if k in m:
+                        hub.route[k] = [float(m[k][0]), float(m[k][1])] if m[k] else None
+            elif c == "shuttle":
+                if m.get("on"):
+                    await start_shuttle(float(m.get("pause", 2)))
+                else:
+                    await stop_shuttle()
             elif c == "drive":
                 l, r = (max(-MAX_DRIVE, min(MAX_DRIVE, float(m[k]))) for k in ("l", "r"))
                 if hub.manual:
@@ -337,7 +438,7 @@ async def ws(w: WebSocket):
                 for k in hub.settings:
                     if k in m:
                         hub.settings[k] = float(m[k])
-    except (WebSocketDisconnect, ValueError):
+    except (WebSocketDisconnect, ValueError, KeyError, IndexError, TypeError):
         pass
     finally:
         hub.clients.discard(w)

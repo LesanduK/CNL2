@@ -47,6 +47,7 @@
   .go.stop{background:var(--sheet);color:var(--red);border-color:var(--red)}
   label{display:block;font-size:13px;color:var(--mute);margin-top:8px}
   input[type=range]{width:100%}
+  .go:disabled{opacity:.45;cursor:not-allowed}
   .note{margin:6px 0 0;color:var(--mute);font-size:13px}
   .stats{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px;margin-bottom:12px}
   .stats small{display:block;color:var(--mute);font-size:12.5px}
@@ -102,8 +103,15 @@
         <button class="go" id="go-follow"></button>
       </div>
       <div id="p-nav">
-        <p class="note" style="margin-top:0">Start navigation, then click a point on the map. The robot plans a path and drives there.</p>
-        <button class="go" id="go-nav"></button>
+        <p class="note" style="margin-top:0">1. Start navigation. 2. Set a start point (A) and an end point (B) on the map. 3. Start the back-and-forth run: the robot drives to A, then goes between A and B until you stop it.</p>
+        <button class="go" id="go-nav" style="margin-top:10px"></button>
+        <div class="stages" style="margin-top:12px">
+          <button class="stage" id="pt-a">Set start point (A) <small id="ta">not set</small></button>
+          <button class="stage" id="pt-b">Set end point (B) <small id="tb">not set</small></button>
+        </div>
+        <label>Pause at each point: <b id="vp">2</b> s<input id="sp" type="range" min="0" max="30" step="1" value="2"></label>
+        <button class="go" id="go-shuttle"></button>
+        <p class="note" id="trips"></p>
       </div>
     </div>
 
@@ -143,6 +151,7 @@ const $ = s => document.querySelector(s), $$ = s => document.querySelectorAll(s)
 const FOLLOW = ["follow1", "follow3"];
 const NAMES = {idle:"Idle", nav:"Navigating", manual:"Manual drive", follow1:"Following: turn only", follow3:"Following: full"};
 let ws, mode = "idle", lastMode = null, S = {}, tab = "follow", stage = "follow3";
+let route = {a: null, b: null}, pick = null, shuttle = {on: false};
 
 function connect(){
   ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
@@ -150,9 +159,9 @@ function connect(){
   ws.onclose = () => { $("#conn").className = "pill"; $("#conn span").textContent = "Reconnecting"; setTimeout(connect, 1000); };
   ws.onmessage = e => {
     const m = JSON.parse(e.data);
-    if (m.t === "state"){ mode = m.mode; S = m.s; render(); }
+    if (m.t === "state"){ mode = m.mode; S = m.s; shuttle = m.shuttle || {on: false}; render(); }
     else if (m.t === "log") log(m.line);
-    else if (m.t === "hello"){ m.log.forEach(log); setSliders(m.settings); }
+    else if (m.t === "hello"){ m.log.forEach(log); setSliders(m.settings); if (m.route) route = m.route; }
   };
 }
 const send = o => ws && ws.readyState === 1 && ws.send(JSON.stringify(o));
@@ -180,8 +189,19 @@ function render(){
   setGo("#go-follow", mode === stage, "Start following", "Stop following");
   setGo("#go-nav", mode === "nav", "Start navigation", "Stop navigation");
   setGo("#go-manual", mode === "manual", "Turn on manual drive", "Turn off manual drive");
+  setGo("#go-shuttle", shuttle.on, "Start back and forth", "Stop back and forth");
+  $("#go-shuttle").disabled = !shuttle.on && !(mode === "nav" && route.a && route.b);
+  $("#pt-a").classList.toggle("sel", pick === "a");
+  $("#pt-b").classList.toggle("sel", pick === "b");
+  $("#ta").textContent = route.a ? `${f(route.a[0])}, ${f(route.a[1])} m` : "not set";
+  $("#tb").textContent = route.b ? `${f(route.b[0])}, ${f(route.b[1])} m` : "not set";
+  $("#trips").textContent = shuttle.on ? `Heading to point ${shuttle.target}${shuttle.phase === "pause" ? " (pausing)" : ""}. One-way trips completed: ${shuttle.trips}.` : "";
   $("#padwrap").hidden = mode !== "manual";
-  $("#hint").textContent = (mode === "nav" ? "Click the map to send the robot there. " : "Start navigation to set goals on the map. ") + `Warehouse ${dims.len} \u00d7 ${dims.wid} m. Origin (0, 0) is the robot's start point, at the centre.`;
+  const lead = pick ? `Click the map to place point ${pick.toUpperCase()}. `
+    : mode !== "nav" ? "Start navigation to set goals on the map. "
+    : shuttle.on ? "Back-and-forth run in progress. "
+    : "Set points A and B, or click the map to send the robot to a single spot. ";
+  $("#hint").textContent = lead + `Warehouse ${dims.len} \u00d7 ${dims.wid} m. Origin (0, 0) is the robot's start point, at the centre.`;
   const p = S.pose;
   $("#pose").textContent = p ? `${f(p[0])}, ${f(p[1])} m` : "-";
   $("#head").textContent = p ? f(p[2] * 180 / Math.PI, 0) + "\u00b0" : "-";
@@ -238,6 +258,14 @@ function draw(){
   cx.textAlign = "left"; cx.font = "11px system-ui";
   const p = S.pose || [0, 0, 0], th = p[2];
   (S.obstacles || []).forEach(o => { cx.fillStyle = "#17252e"; cx.fillRect(X(o[0]) - 3, Y(o[1]) - 3, 6, 6); });
+  if (route.a && route.b){ cx.strokeStyle = "rgba(29,95,166,.5)"; cx.lineWidth = 2; cx.setLineDash([2, 6]); cx.beginPath(); cx.moveTo(X(route.a[0]), Y(route.a[1])); cx.lineTo(X(route.b[0]), Y(route.b[1])); cx.stroke(); cx.setLineDash([]); }
+  [["A", route.a], ["B", route.b]].forEach(([name, q]) => {
+    if (!q) return;
+    cx.fillStyle = "#1d5fa6"; cx.beginPath(); cx.arc(X(q[0]), Y(q[1]), 11, 0, 7); cx.fill();
+    cx.fillStyle = "#fff"; cx.font = "700 12px system-ui"; cx.textAlign = "center"; cx.textBaseline = "middle";
+    cx.fillText(name, X(q[0]), Y(q[1]) + 1);
+    cx.textAlign = "left"; cx.textBaseline = "alphabetic"; cx.font = "11px system-ui";
+  });
   if (S.path && S.path.length > 1){ cx.strokeStyle = "#1d5fa6"; cx.lineWidth = 2; cx.setLineDash([6, 4]); cx.beginPath(); S.path.forEach((q, i) => cx[i ? "lineTo" : "moveTo"](X(q[0]), Y(q[1]))); cx.stroke(); cx.setLineDash([]); }
   if (S.goal){ const gx = X(S.goal[0]), gy = Y(S.goal[1]); cx.strokeStyle = "#c62f1d"; cx.lineWidth = 2; cx.beginPath(); cx.moveTo(gx - 8, gy - 8); cx.lineTo(gx + 8, gy + 8); cx.moveTo(gx + 8, gy - 8); cx.lineTo(gx - 8, gy + 8); cx.stroke(); }
   if (S.tof) [Math.PI / 4, 0, -Math.PI / 4].forEach((a, i) => {   // left, middle, right
@@ -250,11 +278,11 @@ function draw(){
   cx.beginPath(); cx.moveTo(14, 0); cx.lineTo(-9, 9); cx.lineTo(-5, 0); cx.lineTo(-9, -9); cx.fill(); cx.restore();
 }
 cv.addEventListener("click", e => {
-  if (mode !== "nav") return;
   const {W, H, k} = view(), r = cv.getBoundingClientRect();
   const x = (e.clientX - r.left - W / 2) / k, y = -(e.clientY - r.top - H / 2) / k;
   if (Math.abs(x) > dims.len / 2 || Math.abs(y) > dims.wid / 2) return;   // outside the warehouse
-  send({cmd:"goto", x, y});
+  if (pick){ route[pick] = [x, y]; pick = null; send({cmd:"route", a: route.a, b: route.b}); render(); return; }
+  if (mode === "nav" && !shuttle.on) send({cmd:"goto", x, y});            // single goal
 });
 function showDims(){ $("#dl").value = dims.len; $("#dw").value = dims.wid; }
 function setDims(){
@@ -275,6 +303,10 @@ $$(".tab").forEach(b => b.onclick = () => { tab = b.dataset.tab; render(); });
 $$(".stage").forEach(b => b.onclick = () => { stage = b.dataset.s; if (FOLLOW.includes(mode)) send({cmd:"mode", mode: stage}); render(); });
 $("#go-follow").onclick = () => send({cmd:"mode", mode: mode === stage ? "idle" : stage});
 $("#go-nav").onclick = () => send({cmd:"mode", mode: mode === "nav" ? "idle" : "nav"});
+$("#pt-a").onclick = () => { pick = pick === "a" ? null : "a"; render(); };
+$("#pt-b").onclick = () => { pick = pick === "b" ? null : "b"; render(); };
+$("#go-shuttle").onclick = () => send({cmd:"shuttle", on: !shuttle.on, pause: +$("#sp").value});
+$("#sp").oninput = () => { $("#vp").textContent = $("#sp").value; };
 $("#go-manual").onclick = () => send({cmd:"mode", mode: mode === "manual" ? "idle" : "manual"});
 $("#estop").onclick = () => send({cmd:"estop"});
 
