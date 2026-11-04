@@ -29,6 +29,15 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from human_follower.stage3_follower import Stage3Config, Stage3ObstacleFollower
 
+try:  # live data for the web dashboard (does nothing if the dashboard folder is missing)
+    from dashboard.telemetry_client import send, send_frame
+except ImportError:
+    def send(**fields):
+        pass
+
+    def send_frame(*args, **kwargs):
+        pass
+
 
 def draw_stage3_overlay(frame, telem):
     """Draw tracking bounding box, APF vectors (attraction, repulsion, net), ToF badges, and state banner."""
@@ -230,11 +239,28 @@ def main():
             pass
 
     last_log_t = 0.0
+    last_dash_t = 0.0
 
     try:
         while True:
             telem = follower.get_telemetry()
             now = time.monotonic()
+
+            # Live data for the web dashboard (harmless if the dashboard is not running)
+            if now - last_dash_t >= 0.12:
+                last_dash_t = now
+                rpm_k = 60.0 / (2 * math.pi * config.wheel_radius_m)  # commanded m/s -> rpm
+                fields = {"rpm": [float(telem.get("v_left", 0.0) or 0.0) * rpm_k, float(telem.get("v_right", 0.0) or 0.0) * rpm_k]}
+                if telem.get("target_valid"):
+                    fields["target"] = {"bearing": -telem.get("bearing_deg", 0.0), "dist": telem.get("dist_m")}
+                else:
+                    fields["target"] = None
+                fields["tof"] = [min(float(telem.get(k) or 9.99), 2.0) for k in ("tof_left", "tof_mid", "tof_right")]
+                send(**fields)
+                if config.headless:  # with a preview window the frame is sent from the preview code below
+                    ret, frame, _ = follower.vision.camera.read()
+                    if ret and frame is not None and hasattr(frame, "shape"):
+                        send_frame(draw_stage3_overlay(frame.copy(), telem))
 
             if now - last_log_t >= 0.4:
                 state = telem.get("state") or "SEARCHING"
@@ -262,6 +288,7 @@ def main():
                 ret, frame, _ = follower.vision.camera.read()
                 if ret and frame is not None and hasattr(frame, "shape"):
                     annotated = draw_stage3_overlay(frame.copy(), telem)
+                    send_frame(annotated)  # also show it in the web dashboard
                     cv2.imshow("Stage 3 Human Follower (APF Obstacle Avoidance)", annotated)
                     key = cv2.waitKey(1) & 0xFF
                     if key in (ord("q"), 27):
