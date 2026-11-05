@@ -257,7 +257,7 @@ function draw(){
   cx.save(); cx.translate(X(-hl) - 7, H / 2); cx.rotate(-Math.PI / 2); cx.fillText(dims.wid + " m", 0, 0); cx.restore();
   cx.textAlign = "left"; cx.font = "11px system-ui";
   const p = S.pose || [0, 0, 0], th = p[2];
-  (S.obstacles || []).forEach(o => { cx.fillStyle = "#17252e"; cx.fillRect(X(o[0]) - 3, Y(o[1]) - 3, 6, 6); });
+  (S.obstacles || []).forEach(o => { cx.fillStyle = "#17252e"; cx.beginPath(); cx.arc(X(o[0]), Y(o[1]), Math.max(3, (o[2] || 0.08) * k), 0, 7); cx.fill(); });
   if (route.a && route.b){ cx.strokeStyle = "rgba(29,95,166,.5)"; cx.lineWidth = 2; cx.setLineDash([2, 6]); cx.beginPath(); cx.moveTo(X(route.a[0]), Y(route.a[1])); cx.lineTo(X(route.b[0]), Y(route.b[1])); cx.stroke(); cx.setLineDash([]); }
   [["A", route.a], ["B", route.b]].forEach(([name, q]) => {
     if (!q) return;

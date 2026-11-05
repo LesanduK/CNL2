@@ -290,38 +290,51 @@ async def shuttle_loop():
 
 async def simulate():
     """Fake robot so the UI can be tried without hardware (--sim).
-    Follow modes chase a fake person who walks a slow loop: stage 1 only turns, stage 2 also keeps
-    its distance, stage 3 also steers around the obstacles."""
+    Pillars and crates are laid out for a 12 x 8 m floor and scaled to the chosen warehouse. Navigate steers
+    around them, the follow modes chase a walking fake person (full follow also avoids obstacles), and
+    nothing can drive through an obstacle or a wall."""
     x = y = th = 0.0
-    base = [[1.5, 0.5], [1.6, 0.6], [2.5, -0.8], [-1.2, 1.4]]  # laid out for a 12 x 8 m floor, scaled to fit
+    base = [[-4.0, -2.5, 0.3], [4.0, -2.5, 0.3], [4.0, 2.5, 0.3], [-4.0, 2.5, 0.3],   # pillars: x, y, radius (m)
+            [1.5, 0.5, 0.25], [1.7, 0.75, 0.2], [2.6, -0.8, 0.3], [-1.4, 1.3, 0.25],   # crates
+            [0.0, -2.0, 0.35], [-2.5, -0.5, 0.3], [3.2, 1.2, 0.25]]
     obstacles = base
 
     def wrap(a):
         return (a + math.pi) % (2 * math.pi) - math.pi
 
-    def ray(a):  # distance to the nearest obstacle inside a 20 degree cone, 2 m if clear
+    def ray(a):  # gap to the nearest obstacle surface inside a cone, 2 m if clear
         best = 2.0
-        for ox, oy in obstacles:
-            if abs(wrap(math.atan2(oy - y, ox - x) - th - a)) < 0.35:
-                best = min(best, math.hypot(ox - x, oy - y))
+        for ox, oy, r in obstacles:
+            d = math.hypot(ox - x, oy - y)
+            if abs(wrap(math.atan2(oy - y, ox - x) - th - a)) < 0.35 + math.atan2(r, max(d, 0.01)):
+                best = min(best, max(0.0, d - r))
         return best
 
     while True:
         await asyncio.sleep(0.05)
         t, m, v, w = time.time(), hub.mode, 0.0, 0.0
         L, Wd = hub.map
-        obstacles = [[ox * L / 12, oy * Wd / 8] for ox, oy in base]
+        obstacles = [[ox * L / 12, oy * Wd / 8, r] for ox, oy, r in base]
         if m == "manual" and t - hub.drive[2] < 0.4:
             l, r = hub.drive[:2]
             v, w = (l + r) / 2, (r - l) / BASE
         elif m == "nav" and "goal" in hub.state:
             gx, gy = hub.state["goal"]
-            err = wrap(math.atan2(gy - y, gx - x) - th)
-            if math.hypot(gx - x, gy - y) < 0.08:
+            dg = math.hypot(gx - x, gy - y)
+            if dg < 0.08:
                 hub.state.pop("goal")
             else:
-                w, v = 2 * err, 0.3 * max(0.0, math.cos(err))
-                hub.state["path"] = [[x, y], [gx, gy]]
+                # pull toward the goal, push away (with a sideways nudge, so head-on cases slide past) from obstacles
+                fx, fy, nearest = (gx - x) / dg, (gy - y) / dg, 9.0
+                for ox, oy, r in obstacles:
+                    d = math.hypot(x - ox, y - oy)
+                    nearest = min(nearest, d - r)
+                    if d - r < 0.9:
+                        ux, uy = (x - ox) / (d or 1.0), (y - oy) / (d or 1.0)
+                        k = 1.2 * (1 / max(d - r, 0.08) - 1 / 0.9)
+                        fx, fy = fx + k * (ux - 0.7 * uy), fy + k * (uy + 0.7 * ux)
+                err = wrap(math.atan2(fy, fx) - th)
+                w, v = 2.5 * err, 0.3 * max(0.0, math.cos(err)) * min(1.0, max(0.25, nearest / 0.6))
         elif m.startswith("follow"):
             px, py = 0.32 * L * math.cos(t * 0.12), 0.32 * Wd * math.sin(t * 0.18)  # the fake person
             dist = math.hypot(px - x, py - y)
@@ -332,13 +345,17 @@ async def simulate():
             if m != "follow1" and abs(err) < 0.7 and dist > td + 0.1:
                 v = min(hub.settings["max_speed"], 0.8 * (dist - td))
             if m == "follow3":
-                for ox, oy in obstacles:
-                    d, eb = math.hypot(ox - x, oy - y), wrap(math.atan2(oy - y, ox - x) - th)
+                for ox, oy, r in obstacles:
+                    d, eb = math.hypot(ox - x, oy - y) - r, wrap(math.atan2(oy - y, ox - x) - th)
                     if d < 0.8 and abs(eb) < 1.2:
                         w -= (1.0 if eb >= 0 else -1.0) * 1.5 * (0.8 - d) / 0.8  # steer away
                         v = 0.0 if d < 0.3 else min(v, 0.15)
         x, y, th = x + v * math.cos(th) * 0.05, y + v * math.sin(th) * 0.05, th + w * 0.05
         x, y = max(-L / 2 + 0.2, min(L / 2 - 0.2, x)), max(-Wd / 2 + 0.2, min(Wd / 2 - 0.2, y))  # stay inside the walls
+        for ox, oy, r in obstacles:  # robot body is about 12 cm in radius: it cannot enter an obstacle
+            d = math.hypot(x - ox, y - oy)
+            if d < r + 0.12:
+                x, y = ox + (x - ox) / (d or 1.0) * (r + 0.12), oy + (y - oy) / (d or 1.0) * (r + 0.12)
         if m != "idle":
             hub.state.update(pose=[x, y, th], rpm=[(v - w * BASE / 2) * 60 / (2 * math.pi * WHEEL_R),
                                                    (v + w * BASE / 2) * 60 / (2 * math.pi * WHEEL_R)],
